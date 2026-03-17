@@ -443,8 +443,10 @@ def dataprocessgraphobserverv2():
 
         # Build mappings for ID and control dependencies
         id_to_node = {node['id']: node for node in datalist}
-        ctrl_dep_map = {node['id']: node['parent'] for node in datalist}
-
+        ctrl_dep_map = {
+            node['id']: node.get('parent', node.get('ctrl_deps', None))
+            for node in datalist
+        }
         # Collect nodes with specific control dependencies
         nodes_with_ctrl_deps_2 = [node for node in datalist if node.get('parent') == 2]
         nodes_main = [node for node in datalist if node.get('parent') == 1]
