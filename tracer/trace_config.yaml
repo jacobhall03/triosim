@@ -1,0 +1,37 @@
+# Models to profile (must be available in torchvision.models)
+models:
+  - vgg11
+  - vgg13
+  - vgg16
+  - vgg19
+  - resnet18
+  - resnet34
+  - resnet50
+  - resnet101
+  - resnet152
+  - densenet121
+  - densenet161
+  - densenet169
+  - densenet201
+
+# Batch sizes to collect traces for
+batch_sizes:
+  - 128
+
+# Iteration settings
+num_iters: 43       # Total training iterations per model
+profile_start: 40   # Collect profiler+graph data for iterations after this index
+warmup_start: 30    # Collect warmup timing for iterations after this index
+
+# Paths (relative to the tracer/ directory)
+dataset_path: ./ILSVRC2012_img_val
+data_dir: ./data
+
+# DataLoader workers
+workers: 8
+
+# Operators targeted for tensor parallelism (sets tpflag=1 in trace.csv)
+target_ops:
+  - aten::conv2d
+  - aten::linear
+  - aten::embedding

@@ -1,5 +1,11 @@
 .DS_Store
 
+# Private/local files
+ProjectPapers/
+
+# Python cache
+__pycache__/
+
 # Binaries for programs and plugins
 *.exe
 *.exe~

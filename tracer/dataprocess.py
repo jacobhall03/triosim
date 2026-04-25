@@ -1,572 +1,488 @@
-# encoding: utf-8
 import json
 import sys
 import os
-import pandas
+import re
 import pandas as pd
 import numpy as np
-import ast
-import re
-# import numba
-import chardet
 
-#set target operator for tensor parallel
-TARGET_OP_PREFIXES = [
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DEFAULT_TARGET_OPS = [
     'aten::conv2d',
     'aten::linear',
     'aten::embedding',
-    # 'autograd::engine::evaluate_function: EmbeddingBackward0',
-    # 'autograd::engine::evaluate_function: AddmmBackward0',
-    # 'autograd::engine::evaluate_function: ConvolutionBackward0',
-    # 'autograd::engine::evaluate_function: ViewBackward0',
-    # 'autograd::engine::evaluate_function: MmBackward0'
 ]
 
-class Kernellist:
+DEFAULT_CONFIG = {
+    'data_dir': os.path.join(_SCRIPT_DIR, 'data'),
+    'target_ops': DEFAULT_TARGET_OPS,
+}
+
+_PROFILER_COLS = ['modelid', 'layerid', 'cpueventname', 'cudatime', 'cudatimenooverlap', 'inputdims', 'sequenceid']
+_GRAPH_COLS = ['modelid', 'layerid', 'cpueventname', 'inputshapes', 'inputvalues', 'inputtypes',
+               'outputshapes', 'outputvalues', 'outputtypes', 'op_schema']
+_MERGE_COLS = ['layerid', 'cpueventname', 'inputshapes', 'inputvalues', 'inputtypes',
+               'outputshapes', 'outputvalues', 'outputtypes', 'op_schema', 'cudatime',
+               'cudatimenooverlap', 'stage', 'tpflag']
+
+
+def _validate_df(df, required_cols, stage_name):
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"[{stage_name}] Output is missing columns: {missing}")
+    if df.empty:
+        raise ValueError(f"[{stage_name}] Produced an empty dataframe — check input files")
+
+
+class _Kernel:
+    __slots__ = ['name', 'duration', 'starttime', 'endtime', 'correlationid',
+                 'registersperthread', 'sharedmemory', 'warpsperSM', 'grid', 'block', 'stream']
+
     def __init__(self):
+        for s in self.__slots__:
+            setattr(self, s, None)
         self.name = ''
-        self.id = None
-        self.duration = None
-        self.starttime = None
-        self.endtime = None
-        self.correlationid = None
-        self.registersperthread = None
-        self.sharedmemory = None
-        self.blocksperSM = None
-        self.warpsperSM = None
         self.grid = ''
         self.block = ''
-        self.stream = None
 
 
-class Operatorlist:
+class _Operator:
+    __slots__ = ['name', 'duration', 'starttime', 'endtime', 'correlationid', 'cudaevents',
+                 'inputdims', 'sequenceid']
+
     def __init__(self):
         self.name = ''
-        self.id = None
         self.duration = None
         self.starttime = None
         self.endtime = None
         self.correlationid = []
         self.cudaevents = []
-        self.inputdims = ''
-        self.sequenceid =None
+        self.inputdims = []
+        self.sequenceid = None
 
 
-class Eventslist:
-    def __init__(self):
-        self.cpu = []
-        self.cuda = []
+def _process_layer(config):
+    """Parse profiler JSON files → intermediate CSV with per-layer CUDA timing."""
+    src_dir = os.path.join(config['data_dir'], 'profiler')
+    out_dir = os.path.join(config['data_dir'], 'middledata', 'profiler')
+    os.makedirs(out_dir, exist_ok=True)
 
-
-def l_prod(in_list):
-    res = 1
-    for _ in in_list:
-        res *= _
-    return res
-
-
-def load_json(json_file):
-    if json_file is None:
-        print("Error: No json file found.")
-        return
-    print("Analyzing json file: {}".format(json_file))
-    with open(json_file, "r") as f:
-        json_trace = json.load(f)
-
-def dataprocessLayerv2():
-    path = './data/profiler/'
-    files = os.listdir(path)
-    fileid = 0
-    for file in files:
-        print(file)
-        fileid += 1
-        if file == ".DS_Store":
+    for fname in os.listdir(src_dir):
+        if fname == '.DS_Store':
             continue
-
-        with open(path + file, "r" ) as f:
+        print(f"  [layer] {fname}")
+        with open(os.path.join(src_dir, fname)) as f:
             json_trace = json.load(f)
-        cpuevents = []
-        profilerstarttime = 0
+
+        cpu_events = []
+        profiler_start = 0
+
         for event in json_trace['traceEvents']:
-            if (event.get('cat', '').lower() == 'cpu_op') or (event.get('cat', '').lower() == 'operator') and event.get(
-                    'ph', '').lower() == 'x':
-                dur = event['dur']
-                ts = event['ts']
+            cat = event.get('cat', '').lower()
+            ph = event.get('ph', '').lower()
+            name = event.get('name', '')
+
+            if (cat == 'cpu_op' or cat == 'operator') and ph == 'x':
+                dur, ts = event['dur'], event['ts']
                 te = ts + dur
-                popitem = []
-                aoperator = Operatorlist()
-                aoperator.name = event['name']
-                aoperator.duration = dur
-                aoperator.starttime = ts
-                aoperator.endtime = te
-                aoperator.inputdims = event['args'].get('Input Dims', [[]])
-                # aoperator.inputdims = event['args']['Input dims']
-                # aoperator.inputdims = str(event['args']['Input Dims']).replace(' ','').replace(',',';')
-                aoperator.sequenceid=event['args'].get('Sequence number')
-                cpuevents.append(aoperator)
+                op = _Operator()
+                op.name = name
+                op.duration = dur
+                op.starttime = ts
+                op.endtime = te
+                op.inputdims = event['args'].get('Input Dims', [])
+                op.sequenceid = event['args'].get('Sequence number')
 
-                for cpueventsitem in cpuevents:
-                    if (te <= cpueventsitem.endtime and ts > cpueventsitem.starttime) or (
-                            te < cpueventsitem.endtime and ts >= cpueventsitem.starttime) \
-                            or (
-                            te == cpueventsitem.endtime and ts == cpueventsitem.starttime and aoperator.name != cpueventsitem.name):
-                        popitem.append(aoperator)
-                    elif te >= cpueventsitem.endtime and ts < cpueventsitem.starttime:
-                        popitem.append(cpueventsitem)
+                to_remove = []
+                for existing in cpu_events:
+                    if (te <= existing.endtime and ts > existing.starttime) or \
+                       (te < existing.endtime and ts >= existing.starttime) or \
+                       (te == existing.endtime and ts == existing.starttime and op.name != existing.name):
+                        to_remove.append(op)
+                    elif te >= existing.endtime and ts < existing.starttime:
+                        to_remove.append(existing)
+                for item in to_remove:
+                    if item in cpu_events:
+                        cpu_events.remove(item)
+                cpu_events.append(op)
 
-                for item in popitem:
-                    if item in cpuevents:
-                        cpuevents.remove(item)
+            elif (cat == 'cuda_runtime' or cat == 'runtime') and ph == 'x' and \
+                    name.lower() == 'cudalaunchkernel':
+                corr = event['args']['correlation']
+                ts, te = event['ts'], event['ts'] + event['dur']
+                for op in cpu_events:
+                    if op.endtime > te and op.starttime < ts:
+                        op.correlationid.append(corr)
 
-
-            elif (event.get('cat', '').lower() == 'cuda_runtime') or (
-                    event.get('cat', '').lower() == 'runtime') and event.get('ph', '').lower() == 'x' and event.get(
-                'name', '').lower() == 'cudalaunchkernel':
-                dur = event['dur']
-                ts = event['ts']
-                te = ts + dur
-                correlationid = event['args']["correlation"]
-                for cpueventsitem in cpuevents:
-                    if cpueventsitem.endtime > te and cpueventsitem.starttime < ts:
-                        cpueventsitem.correlationid.append(correlationid)
-            elif event.get('name', '') == 'Iteration Start: PyTorch Profiler':
-
-                profilerstarttime = event.get('ts')
+            elif name == 'Iteration Start: PyTorch Profiler':
+                profiler_start = event.get('ts', 0)
 
         for event in json_trace['traceEvents']:
             if event.get('cat', '').lower() == 'kernel' and event.get('ph', '').lower() == 'x':
-                correlationid = event['args']["correlation"]
-                dur = event['dur']
-                ts = event['ts']
+                corr = event['args']['correlation']
+                dur, ts = event['dur'], event['ts']
                 te = ts + dur
-                cudaevents = []
-                for cpueventsitem in cpuevents:
-                    if correlationid in cpueventsitem.correlationid:
-                        akernel = Kernellist()
-                        akernel.name = event['name']
-                        akernel.duration = dur
-                        akernel.starttime = ts
-                        akernel.endtime = te
-                        akernel.correlationid = correlationid
-                        akernel.registersperthread = event['args']['registers per thread']
-                        akernel.sharedmemory = event['args']['shared memory']
-                        akernel.blocksperSM = ''  # event['args']['blocks per SM']
-                        akernel.warpsperSM = event['args']['warps per SM']
-                        akernel.grid = event['args']['grid']
-                        akernel.block = event['args']['block']
-                        akernel.stream = event['args']['stream']
-                        cudaevents.append(akernel)
-                        cpueventsitem.cudaevents.append(cudaevents)
-        layerid = 0
-        data = []
-        cpuevents.sort(key=lambda x: x.starttime)
-        for cpueventsitem in cpuevents:
-            layerid += 1
-            mincuda = 0
-            maxcuda = 0
-            cudatimenooverlap = 0
-            for cudaeventsitem in cpueventsitem.cudaevents:
-                for item in cudaeventsitem:
-                    if mincuda == 0:
-                        mincuda = item.starttime - profilerstarttime
-                    elif mincuda > item.starttime - profilerstarttime:
-                        mincuda = item.starttime - profilerstarttime
-                    if maxcuda < item.endtime - profilerstarttime:
-                        maxcuda = item.endtime - profilerstarttime
-                    cudatimenooverlap += item.endtime - item.starttime
-            cudatime = maxcuda - mincuda
+                for op in cpu_events:
+                    if corr in op.correlationid:
+                        k = _Kernel()
+                        k.name = event['name']
+                        k.duration = dur
+                        k.starttime = ts
+                        k.endtime = te
+                        k.correlationid = corr
+                        k.registersperthread = event['args']['registers per thread']
+                        k.sharedmemory = event['args']['shared memory']
+                        k.warpsperSM = event['args']['warps per SM']
+                        k.grid = event['args']['grid']
+                        k.block = event['args']['block']
+                        k.stream = event['args']['stream']
+                        op.cudaevents.append([k])
 
-            data.append({
-                "modelid": file.replace(".json","").replace("profiler_",""),
-                "layerid": layerid,
-                "cpueventname": cpueventsitem.name,
-                "cudatime": cudatime,
-                "cudatimenooverlap": cudatimenooverlap,
-                "inputdims": str(cpueventsitem.inputdims).replace(' ', '').replace(',', ';'),
-                "sequenceid":cpueventsitem.sequenceid
+        cpu_events.sort(key=lambda x: x.starttime)
+        rows = []
+        for layer_id, op in enumerate(cpu_events, start=1):
+            min_cuda, max_cuda, no_overlap = 0, 0, 0
+            for kernel_group in op.cudaevents:
+                for k in kernel_group:
+                    t_start = k.starttime - profiler_start
+                    t_end = k.endtime - profiler_start
+                    if min_cuda == 0 or t_start < min_cuda:
+                        min_cuda = t_start
+                    if t_end > max_cuda:
+                        max_cuda = t_end
+                    no_overlap += k.endtime - k.starttime
+            rows.append({
+                'modelid': fname.replace('.json', '').replace('profiler_', ''),
+                'layerid': layer_id,
+                'cpueventname': op.name,
+                'cudatime': max_cuda - min_cuda,
+                'cudatimenooverlap': no_overlap,
+                'inputdims': json.dumps(op.inputdims),
+                'sequenceid': op.sequenceid,
             })
 
-        # Create DataFrame
-        df = pd.DataFrame(data)
-        # Save to CSV
-        directory = os.path.join('./data/middledata/profiler')
-        os.makedirs(directory, exist_ok=True)
-        df.to_csv(directory +'/'+file.replace(".json", "")+ '.csv', index=False)
+        df = pd.DataFrame(rows)
+        _validate_df(df, _PROFILER_COLS, f'_process_layer/{fname}')
+        out_path = os.path.join(out_dir, fname.replace('.json', '.csv'))
+        df.to_csv(out_path, index=False)
 
 
-def datamerge():
-    dir1 = './data/middledata/graph'
-    dir2 = './data/middledata/profiler'
+def _process_graph(config):
+    """Parse execution graph JSON files → intermediate CSV with tensor metadata."""
+    src_dir = os.path.join(config['data_dir'], 'graph')
+    out_dir = os.path.join(config['data_dir'], 'middledata', 'graph')
+    os.makedirs(out_dir, exist_ok=True)
 
-    # Iterate through files in the first directory
-    for filename in os.listdir(dir1):
-        print(filename)
-        if filename == ".DS_Store":
+    for file_id, fname in enumerate(os.listdir(src_dir)):
+        if fname == '.DS_Store':
             continue
-        path_csv1 = os.path.join(dir1, filename)
-        path_csv2 = os.path.join(dir2, filename.replace("graph_","profiler_"))
-        print(path_csv1)
-        print(path_csv2)
+        if file_id >= 100:
+            break
+        print(f"  [graph] {fname}")
+        with open(os.path.join(src_dir, fname), encoding='utf-8') as f:
+            json_trace = json.load(f)
 
-        # Check if the corresponding file exists in the second directory
-        if os.path.exists(path_csv2):
-            # Read the CSV files into DataFrames
-            df1 = pd.read_csv(path_csv1)
-            df2 = pd.read_csv(path_csv2)
+        nodes = json_trace['nodes']
+        id_to_node = {n['id']: n for n in nodes}
 
-            # Merge the DataFrames on 'layerid' and 'cpueventname'
-            merged_df = pd.merge(df1, df2, on=['layerid', 'cpueventname'], suffixes=('_df1', '_df2'))
-            merged_df = merged_df[merged_df['cpueventname'] != 'aten::item']
-            # merged_df['stage'] = np.where(merged_df['cpueventname'].str.startswith(('autograd', 'aten::_for')), 'backward', 'forward')
-            conditions = [
-                merged_df['cpueventname'].str.startswith("autograd"),
-                merged_df['cpueventname'].str.startswith("aten::_for")
-            ]
+        nodes_level2 = [n for n in nodes if n.get('parent') == 2]
+        nodes_main = [n for n in nodes if n.get('parent') == 1]
 
-            choices = ['backward', 'optimizer']
-            merged_df['stage'] = np.select(conditions, choices, default='forward')
-            
-            # merged_df['tpflag'] = np.where(
-            #     merged_df['cpueventname'].apply(
-            #         lambda name: any(name.startswith(prefix) for prefix in TARGET_OP_PREFIXES)
-            #     ),
-            #     1, 0
-            # )
-            # Step 1: Find sids where name is either 'conv' or 'test'
-            target_sids = merged_df.loc[merged_df['cpueventname'].isin(TARGET_OP_PREFIXES), 'sequenceid'].unique()
-            # Step 2: Initialize flag to 1 for all rows
-            merged_df['tpflag'] = 0
-            # Step 3: Set flag to 0 for rows with sid in target_sids
-            merged_df.loc[merged_df['sequenceid'].isin(target_sids), 'tpflag'] = 1
-            # Save the merged DataFrame to a new CSV file if needed
-            directory = os.path.join('./data/middledata/mergedata')
-            os.makedirs(directory, exist_ok=True)
-            merged_df.to_csv(directory +'/'+filename.replace("graph_",""), index=False)
+        back_id = None
+        for n in nodes_main:
+            if n['id'] not in {1, 2}:
+                back_id = n['id']
+        nodes_back = [n for n in nodes if n.get('parent') == back_id]
 
-def dataformatfortrace():
-    def extract_items(data):
-        extracted_items = []
-        if isinstance(data[0], list):
-            # If the first element is a list of lists, extend the extracted items with its elements
-            for sublist in data:
-                extracted_items.extend(sublist)
-        else:
-            # If the first element is a list of integers, add it directly
-            extracted_items = data
-        return extracted_items
-    # Define a function to safely evaluate shapes
-    def safe_eval(shape_str):
-        try:
-            return ast.literal_eval(shape_str)
-        except (ValueError, SyntaxError):
-            return shape_str
+        def node_row(name, node, idx):
+            return {
+                'modelid': fname.replace('graph_', '').replace('.json', ''),
+                'layerid': idx,
+                'cpueventname': name,
+                'inputshapes': json.dumps(node.get('input_shapes', [])),
+                'inputvalues': json.dumps(node.get('inputs', [])),
+                'inputtypes': json.dumps(node.get('input_types', [])),
+                'outputshapes': json.dumps(node.get('output_shapes', [])),
+                'outputvalues': json.dumps(node.get('outputs', [])),
+                'outputtypes': json.dumps(node.get('output_types', [])),
+                'op_schema': node.get('op_schema', '').replace(',', ';'),
+            }
 
-    def parse_op_schema(op_schema_str):
-        split_by_commasep = op_schema_str.split(';')
-        results = []
-        for i, item in enumerate(split_by_commasep):
+        def is_empty(n):
+            return (n.get('input_shapes') == [] and n.get('inputs') == [] and
+                    n.get('input_types') == [] and n.get('output_shapes') == [] and
+                    n.get('outputs') == [] and n.get('output_types') == [])
+
+        def get_children(node):
+            return [n for n in nodes if n.get('parent') == node['id']]
+
+        rows = []
+        idx = 0
+        optimizer_ids = []
+
+        for n in nodes_level2:
+            if 'Optimizer' in n['name']:
+                optimizer_ids.append(n['id'])
+            if not is_empty(n):
+                idx += 1
+                rows.append(node_row(n['name'], n, idx))
+
+        for n in nodes_back:
+            children = get_children(n)
+            grandchildren = get_children(children[0]) if children else []
+            target = grandchildren[0] if grandchildren else (children[0] if children else None)
+            if target is None or is_empty(target):
+                continue
+            idx += 1
+            rows.append(node_row(n['name'], target, idx))
+
+        for op_id in optimizer_ids:
+            for subnode in [n for n in nodes if n.get('parent') == op_id]:
+                idx += 1
+                rows.append(node_row(subnode['name'], subnode, idx))
+
+        df = pd.DataFrame(rows)
+        _validate_df(df, _GRAPH_COLS, f'_process_graph/{fname}')
+        out_path = os.path.join(out_dir, fname.replace('.json', '.csv'))
+        df.to_csv(out_path, index=False)
+
+
+def _merge_data(config):
+    """Merge graph and profiler CSVs; classify stage and tpflag."""
+    graph_dir = os.path.join(config['data_dir'], 'middledata', 'graph')
+    profiler_dir = os.path.join(config['data_dir'], 'middledata', 'profiler')
+    out_dir = os.path.join(config['data_dir'], 'middledata', 'mergedata')
+    os.makedirs(out_dir, exist_ok=True)
+
+    target_ops = config.get('target_ops', DEFAULT_TARGET_OPS)
+
+    for fname in os.listdir(graph_dir):
+        if fname == '.DS_Store':
+            continue
+        profiler_fname = fname.replace('graph_', 'profiler_')
+        profiler_path = os.path.join(profiler_dir, profiler_fname)
+        if not os.path.exists(profiler_path):
+            print(f"  [merge] WARNING: no matching profiler file for {fname}, skipping")
+            continue
+        print(f"  [merge] {fname}")
+
+        df_graph = pd.read_csv(os.path.join(graph_dir, fname))
+        df_profiler = pd.read_csv(profiler_path)
+
+        merged = pd.merge(df_graph, df_profiler, on=['layerid', 'cpueventname'], suffixes=('_graph', '_profiler'))
+        merged = merged[merged['cpueventname'] != 'aten::item']
+
+        conditions = [
+            merged['cpueventname'].str.startswith('autograd'),
+            merged['cpueventname'].str.startswith('aten::_for'),
+        ]
+        merged['stage'] = np.select(conditions, ['backward', 'optimizer'], default='forward')
+
+        target_sids = merged.loc[merged['cpueventname'].isin(target_ops), 'sequenceid'].unique()
+        merged['tpflag'] = 0
+        merged.loc[merged['sequenceid'].isin(target_sids), 'tpflag'] = 1
+
+        _validate_df(merged, _MERGE_COLS, f'_merge_data/{fname}')
+        merged.to_csv(os.path.join(out_dir, fname.replace('graph_', '')), index=False)
+
+
+def _format_trace(config):
+    """Convert merged CSVs to final tensor.csv and trace.csv for the simulator."""
+    src_dir = os.path.join(config['data_dir'], 'middledata', 'mergedata')
+
+    def parse_op_schema(schema_str):
+        parts = schema_str.split(';')
+        result = []
+        for i, part in enumerate(parts):
             if i == 0:
-                item = item.split('(')[1]
-            elif i == len(split_by_commasep) - 1:
-                item = item.split(')')[0]
-            item = item.strip()
-            item_result = item.split(" ")
-            results.append(item_result)
-        return results
+                part = part.split('(')[1] if '(' in part else part
+            elif i == len(parts) - 1:
+                part = part.split(')')[0] if ')' in part else part
+            result.append(part.strip().split(' '))
+        return result
 
-    def parse_complex_datatype(datatype_str):
-        datatype_str = datatype_str.replace('GenericList[', '').replace(']', '')
-        items = datatype_str.split(',')
-        return [item.strip() for item in items]
+    def parse_generic_list_type(type_str):
+        inner = type_str.replace('GenericList[', '').replace(']', '')
+        return [t.strip() for t in inner.split(',')]
 
-    dir = './data/middledata/mergedata/'
-    # Iterate through files in the first directory
-    for filename in os.listdir(dir):
-        if filename == ".DS_Store":
+    for fname in os.listdir(src_dir):
+        if fname == '.DS_Store':
             continue
-        path_csv1 = os.path.join(dir, filename)
-        df = pd.read_csv(path_csv1)
+        print(f"  [format] {fname}")
+        df = pd.read_csv(os.path.join(src_dir, fname))
 
-        # Initialize a dictionary to hold the tensor ID to shape mapping
-        tensor_details = []
-        operator_details = []
+        tensor_rows = []
+        operator_rows = []
 
-        # Loop through each row in the DataFrame
-        for index, row in df.iterrows():
-            input_tensorid = []
-            output_tensorid = []
-            input_size = []
-            output_size = []
-            # Extract and reformat the strings into valid Python list strings by replacing ';' with ','
-            input_shapes_str = '[' + row['inputshapes'].replace(';', ',') + ']'
-            input_values_str = '[' + row['inputvalues'].replace(';', ',') + ']'
-            input_datatype_str = '[' + row['inputtypes'].replace(';', ',') + ']'
-            output_shapes_str = '[' + row['outputshapes'].replace(';', ',') + ']'
-            output_values_str = '[' + row['outputvalues'].replace(';', ',') + ']'
-            output_datatype_str = '[' + row['outputtypes'].replace(';', ',') + ']'
-
-            # Evaluate the string to get the nested list structure
-            input_shapes = safe_eval(input_shapes_str)
-            input_values = safe_eval(input_values_str)
-            input_datatype = safe_eval(input_datatype_str)
-            output_shapes = safe_eval(output_shapes_str)
-            output_values = safe_eval(output_values_str)
-            output_datatype = safe_eval(output_datatype_str)
-
-            # Extract items from the nested structures
-            shape = extract_items(input_shapes)
-            value = extract_items(input_values)
-            datatype = input_datatype[0]
-
-            o_shape = extract_items(output_shapes)
-            o_value = extract_items(output_values)
-            o_datatype = output_datatype[0]
+        for _, row in df.iterrows():
+            try:
+                input_shapes = json.loads(row['inputshapes'])
+                input_values = json.loads(row['inputvalues'])
+                input_types = json.loads(row['inputtypes'])
+                output_shapes = json.loads(row['outputshapes'])
+                output_values = json.loads(row['outputvalues'])
+                output_types = json.loads(row['outputtypes'])
+            except (json.JSONDecodeError, TypeError) as e:
+                print(f"    WARNING: JSON parse error in row {row.get('layerid')}: {e}, skipping")
+                continue
 
             if pd.isna(row['op_schema']):
                 continue
-            op_schema_str = row['op_schema'].replace('Tensor(a!)','Tensor').replace('Tensor(a)','Tensor').replace('Tensor(a -> *) self','Tensor input')
-            op_schema_str = op_schema_str.replace('Tensor self', 'Tensor input')
-            if op_schema_str.replace(" ", "") == '':
+            schema_str = (row['op_schema']
+                          .replace('Tensor(a!)', 'Tensor')
+                          .replace('Tensor(a)', 'Tensor')
+                          .replace('Tensor(a -> *) self', 'Tensor input')
+                          .replace('Tensor self', 'Tensor input'))
+            if not schema_str.strip():
                 continue
+            op_schema = parse_op_schema(schema_str)
 
-            op_schema = parse_op_schema(op_schema_str)
-            for i in range(len(value)):
-                if "tensor" in datatype[i].lower():
-                    if "GenericList" not in datatype[i]:
-                        tensor_id = value[i][0]
-                        tensor_Storgeid = value[i][1]
-                        tensor_elementnum = value[i][3]
-                        tensor_elementbyte = value[i][4]
-                        tensor_shape = shape[i]
-                        tensor_cat = op_schema[i][1]
-                        tensor_details.append((tensor_id, tensor_shape, tensor_elementnum, tensor_elementbyte,tensor_cat.replace(")","").replace("(",""),tensor_Storgeid))
-                        input_tensorid.append(tensor_id)
-                        input_size.append(tensor_elementnum)
-                    else:
-                        datatype_list = parse_complex_datatype(datatype[i])
-                        value_list = value[i]
-                        shape_list = shape[i]
-                        for index, item in enumerate(datatype_list):
-                            tensor_id = value_list[index][0]
-                            tensor_Storgeid = value_list[index][1]
-                            tensor_elementnum = value_list[index][3]
-                            tensor_elementbyte = value_list[index][4]
-                            tensor_shape = shape_list[index]
-                            # tensor_cat = op_schema[index][1]
-                            tensor_cat = 'input'
-                            tensor_details.append((tensor_id, tensor_shape, tensor_elementnum, tensor_elementbyte,
-                                                   tensor_cat, tensor_Storgeid))
-                            input_tensorid.append(tensor_id)
-                            input_size.append(tensor_elementnum)
+            input_tensor_ids = []
+            output_tensor_ids = []
+            input_sizes = []
+            output_sizes = []
 
-            for i in range(len(o_value)):
-                if "tensor" in o_datatype[i].lower():
-                    if "GenericList" not in o_datatype[i]:
-                        tensor_id = o_value[i][0]
-                        tensor_Storgeid = o_value[i][1]
-                        tensor_elementnum = o_value[i][3]
-                        tensor_elementbyte = o_value[i][4]
-                        tensor_shape = o_shape[i]
-                        tensor_details.append((tensor_id, tensor_shape, tensor_elementnum, tensor_elementbyte,'output',tensor_Storgeid))
-                        output_tensorid.append(tensor_id)
-                        output_size.append(tensor_elementnum)
-                    else:
-                        o_datatype_list = parse_complex_datatype(o_datatype[i])
-                        o_value_list = o_value[i]
-                        o_shape_list = o_shape[i]
-                        for index, item in enumerate(o_datatype_list):
-                            tensor_id = o_value_list[index][0]
-                            tensor_Storgeid = o_value_list[index][1]
-                            tensor_elementnum = o_value_list[index][3]
-                            tensor_elementbyte = o_value_list[index][4]
-                            tensor_shape = o_shape_list[index]
-                            tensor_details.append((tensor_id, tensor_shape, tensor_elementnum, tensor_elementbyte,
-                                                   'output', tensor_Storgeid))
-                            output_tensorid.append(tensor_id)
-                            output_size.append(tensor_elementnum)
+            for i in range(len(input_values)):
+                if i >= len(input_types):
+                    break
+                t = input_types[i]
+                if 'tensor' not in t.lower():
+                    continue
+                if 'GenericList' not in t:
+                    tid = input_values[i][0]
+                    tensor_rows.append((
+                        tid,
+                        input_shapes[i] if i < len(input_shapes) else [],
+                        input_values[i][3],
+                        input_values[i][4],
+                        op_schema[i][1].replace(')', '').replace('(', '') if i < len(op_schema) and len(op_schema[i]) > 1 else 'input',
+                        input_values[i][1],
+                    ))
+                    input_tensor_ids.append(tid)
+                    input_sizes.append(input_values[i][3])
+                else:
+                    sub_types = parse_generic_list_type(t)
+                    val_list = input_values[i]
+                    shape_list = input_shapes[i] if i < len(input_shapes) else []
+                    for j, _ in enumerate(sub_types):
+                        if j >= len(val_list):
+                            break
+                        tid = val_list[j][0]
+                        tensor_rows.append((
+                            tid,
+                            shape_list[j] if j < len(shape_list) else [],
+                            val_list[j][3],
+                            val_list[j][4],
+                            'input',
+                            val_list[j][1],
+                        ))
+                        input_tensor_ids.append(tid)
+                        input_sizes.append(val_list[j][3])
+
+            for i in range(len(output_values)):
+                if i >= len(output_types):
+                    break
+                t = output_types[i]
+                if 'tensor' not in t.lower():
+                    continue
+                if 'GenericList' not in t:
+                    tid = output_values[i][0]
+                    tensor_rows.append((
+                        tid,
+                        output_shapes[i] if i < len(output_shapes) else [],
+                        output_values[i][3],
+                        output_values[i][4],
+                        'output',
+                        output_values[i][1],
+                    ))
+                    output_tensor_ids.append(tid)
+                    output_sizes.append(output_values[i][3])
+                else:
+                    sub_types = parse_generic_list_type(t)
+                    val_list = output_values[i]
+                    shape_list = output_shapes[i] if i < len(output_shapes) else []
+                    for j, _ in enumerate(sub_types):
+                        if j >= len(val_list):
+                            break
+                        tid = val_list[j][0]
+                        tensor_rows.append((
+                            tid,
+                            shape_list[j] if j < len(shape_list) else [],
+                            val_list[j][3],
+                            val_list[j][4],
+                            'output',
+                            val_list[j][1],
+                        ))
+                        output_tensor_ids.append(tid)
+                        output_sizes.append(val_list[j][3])
+
+            operator_rows.append((
+                row['layerid'],
+                row['cpueventname'],
+                str(input_tensor_ids).replace(',', ';'),
+                str(output_tensor_ids).replace(',', ';'),
+                row['cudatime'],
+                row['cudatimenooverlap'],
+                str(input_sizes).replace(',', ';'),
+                str(output_sizes).replace(',', ';'),
+                '0',
+                row['stage'],
+                row['tpflag'],
+            ))
+
+        tensor_df = pd.DataFrame(tensor_rows,
+                                 columns=['TensorID', 'TensorShape', 'TensorNumElement',
+                                          'TensorEachByte', 'TensorType', 'TensorStorgeid'])
+        tensor_df.insert(0, 'Index', range(len(tensor_df)))
+        tensor_df['gpuid'] = '0'
+        tensor_df = tensor_df[['Index', 'TensorID', 'TensorShape', 'TensorNumElement',
+                                'TensorEachByte', 'TensorType', 'TensorStorgeid', 'gpuid']]
+
+        op_df = pd.DataFrame(operator_rows,
+                             columns=['OperatorID', 'OperatorName', 'Operator_input', 'Operator_output',
+                                      'Operator_cudatime', 'Operator_cudatimenooverlap',
+                                      'InputSize', 'OutputSize', 'gpuid', 'stage', 'tpflag'])
+        op_df = op_df[op_df['Operator_cudatime'] != 0]
+
+        model_name = re.sub(r'-iter.*', '', fname.replace('.csv', ''))
+        out_dir = os.path.join(config['data_dir'], 'middledata', 'trace', model_name)
+        os.makedirs(out_dir, exist_ok=True)
+        tensor_df.to_csv(os.path.join(out_dir, 'tensor.csv'), index=False)
+        op_df.to_csv(os.path.join(out_dir, 'trace.csv'), index=False)
+        print(f"    wrote {len(tensor_df)} tensors, {len(op_df)} operators → {out_dir}")
 
 
-            operatorid = row['layerid']
-            operatorname = row['cpueventname']
-            operator_input = str(input_tensorid).replace(',',';')
-            operator_output = str(output_tensorid).replace(',',';')
-            operator_cudatime = row['cudatime'] #time unit: us
-            operator_cudatimenooverlap= row['cudatimenooverlap'] #single stream use this
-            operator_inputsize = str(input_size).replace(',',';')
-            operator_outputsize = str(output_size).replace(',', ';')
-            operator_gpuid = "0"
-            operator_stage = row['stage']
-            operator_tpflag = row['tpflag']
+def process_traces(config):
+    data_dir = config.get('data_dir', DEFAULT_CONFIG['data_dir'])
+    if not os.path.isabs(data_dir):
+        data_dir = os.path.join(_SCRIPT_DIR, data_dir)
+    config = {**config, 'data_dir': data_dir}
+
+    print("==> Stage 1/4: processing profiler JSON files")
+    _process_layer(config)
+    print("==> Stage 2/4: processing graph JSON files")
+    _process_graph(config)
+    print("==> Stage 3/4: merging profiler and graph data")
+    _merge_data(config)
+    print("==> Stage 4/4: formatting final trace CSVs")
+    _format_trace(config)
+
+    out_dir = os.path.join(config['data_dir'], 'middledata', 'trace')
+    print(f"\nDone. Traces written to: {out_dir}")
 
 
-            operator_details.append((operatorid,operatorname,operator_input,operator_output,operator_cudatime,
-                                     operator_cudatimenooverlap,operator_inputsize,operator_outputsize,
-                                     operator_gpuid,operator_stage,operator_tpflag))
+if __name__ == '__main__':
+    import yaml
 
-        tensor_df = pd.DataFrame(tensor_details, columns=['TensorID', 'TensorShape', 'TensorNumElement', 'TensorEachByte','TensorType','TensorStorgeid'])
-        # tensor_df = tensor_df.drop_duplicates(subset=['TensorID']) # remove the duplicate? but the tensor mybe different type in different layer
-        tensor_df['Index'] = range(len(tensor_df))
-        tensor_df['gpuid'] = "0"
-        tensor_df = tensor_df[['Index', 'TensorID', 'TensorShape', 'TensorNumElement', 'TensorEachByte', 'TensorType',
-             'TensorStorgeid', 'gpuid']]
-        filename = filename.replace(".csv", "")
-        # Use re.sub to remove '-iter' and everything after it
-        filename = re.sub(r'-iter.*', '', filename)
-        directory = os.path.join('./data/middledata/trace', filename)
-        # Create the directory if it doesn't exist.
-        os.makedirs(directory, exist_ok=True)
-        tensor_file = os.path.join(directory, 'tensor.csv')
-        tensor_df.to_csv(tensor_file, index=False)
+    cfg = DEFAULT_CONFIG.copy()
 
-        operator_df = pd.DataFrame(operator_details, columns=['OperatorID', 'OperatorName', 'Operator_input', 'Operator_output','Operator_cudatime','Operator_cudatimenooverlap','InputSize','OutputSize','gpuid','stage','tpflag'])
-        # operator_df['gpuid'] = "0"
-        operator_df = operator_df[operator_df['Operator_cudatime'] != 0]
+    config_path = os.path.join(_SCRIPT_DIR, 'trace_config.yaml')
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            file_cfg = yaml.safe_load(f)
+        cfg.update(file_cfg)
+        for key in ('data_dir',):
+            if key in file_cfg and not os.path.isabs(file_cfg[key]):
+                cfg[key] = os.path.join(_SCRIPT_DIR, file_cfg[key])
 
-        output_file = os.path.join(directory, 'trace.csv')
-        operator_df.to_csv(output_file, index=False)
-
-def dataprocessgraphobserverv2():
-    path = './data/graph/'
-    files = os.listdir(path)
-    fileid = 0
-
-    for file in files:
-        if file == ".DS_Store":
-            continue
-        fileid += 1
-        if fileid >= 100:
-            break
-        print(file)
-        with open(os.path.join(path, file), "r", encoding='utf-8') as f:
-            json_trace = json.load(f)
-        datalist = json_trace['nodes']
-
-        # Build mappings for ID and control dependencies
-        id_to_node = {node['id']: node for node in datalist}
-        ctrl_dep_map = {
-            node['id']: node.get('parent', node.get('ctrl_deps', None))
-            for node in datalist
-        }
-        # Collect nodes with specific control dependencies
-        nodes_with_ctrl_deps_2 = [node for node in datalist if node.get('parent') == 2]
-        nodes_main = [node for node in datalist if node.get('parent') == 1]
-        backid = None
-        for node in nodes_main:
-            if node['id'] not in {1, 2}:
-                backid = node['id']
-
-        nodes_with_ctrl_deps_back = [node for node in datalist if node.get('parent') == backid]
-
-        # Initialize data storage
-        index = 0
-        data = []
-        Optimizerid = []
-        for node in nodes_with_ctrl_deps_2:
-            op_schema = node.get('op_schema', '')
-            if "Optimizer" in node['name']:
-                Optimizerid.append(node['id'])
-            inputshapes = str(node['input_shapes']).replace(' ', '').replace(',', ';')
-            inputvalues = str(node['inputs']).replace(' ', '').replace(',', ';')
-            inputtypes = str(node['input_types']).replace(' ', '').replace(',', ';')
-            outputshapes = str(node['output_shapes']).replace(' ', '').replace(',', ';')
-            outputvalues = str(node['outputs']).replace(' ', '').replace(',', ';')
-            outputtypes = str(node['output_types']).replace(' ', '').replace(',', ';')
-
-            if not (inputshapes == '[]' and inputvalues=='[]' and inputtypes == '[]' and outputshapes == '[]'
-                    and outputvalues=='[]' and outputtypes == '[]'):
-                index += 1
-                data.append({
-                    "modelid": file.replace("graph_", "").replace(".json", ""),
-                    "layerid": index,
-                    "cpueventname": node['name'],
-                    "inputshapes": inputshapes,
-                    "inputvalues":inputvalues,
-                    "inputtypes": inputtypes,
-                    "outputshapes": outputshapes,
-                    "outputvalues":outputvalues,
-                    "outputtypes": outputtypes,
-                    "op_schema": op_schema.replace(',', ';')
-                })
-
-        def get_children(node, datalist):
-            children = []
-            for n in datalist:
-                parent = n.get('parent')  # Use 'parent' instead of 'ctrl_deps' in the new format
-                if parent == node['id']:
-                    children.append(n)
-            return children
-
-        for node in nodes_with_ctrl_deps_back:
-            children = get_children(node, datalist)
-            grandchildren = get_children(children[0], datalist) if children else []
-            if grandchildren:
-                grandchildren = grandchildren[0]
-            else:
-                grandchildren = children[0] if children else None
-            if not grandchildren:
-                continue
-
-            op_schema = grandchildren.get('op_schema', '')
-
-            inputshapes = str(grandchildren.get('input_shapes', [])).replace(' ', '').replace(',', ';')
-            inputvalues = str(grandchildren.get('inputs', [])).replace(' ', '').replace(',', ';')
-            inputtypes = str(grandchildren.get('input_types', [])).replace(' ', '').replace(',', ';')
-            outputshapes = str(grandchildren.get('output_shapes', [])).replace(' ', '').replace(',', ';')
-            outputvalues = str(grandchildren.get('outputs', [])).replace(' ', '').replace(',', ';')
-            outputtypes = str(grandchildren.get('output_types', [])).replace(' ', '').replace(',', ';')
-
-            if not (inputshapes == '[]' and inputvalues == '[]'and inputtypes == '[]' and outputshapes == '[]'
-                    and outputvalues=='[]' and outputtypes == '[]'):
-                index += 1
-                data.append({
-                    "modelid": file.replace("graph_", "").replace(".json", ""),
-                    "layerid": index,
-                    "cpueventname": node['name'],
-                    "inputshapes": inputshapes,
-                    "inputvalues":inputvalues,
-                    "inputtypes": inputtypes,
-                    "outputshapes": outputshapes,
-                    "outputvalues":outputvalues,
-                    "outputtypes": outputtypes,
-                    "op_schema": op_schema.replace(',', ';')
-                })
-
-        for opid in Optimizerid:
-            opnodes = [node for node in datalist if node.get('parent') == opid]  # Use 'parent' instead of 'ctrl_deps'
-            for opsubnode in opnodes:
-                op_schema = opsubnode.get('op_schema', '')
-
-                inputshapes = str(opsubnode.get('input_shapes', [])).replace(' ', '').replace(',', ';')
-                inputvalues = str(opsubnode.get('inputs', [])).replace(' ', '').replace(',', ';')
-                inputtypes = str(opsubnode.get('input_types', [])).replace(' ', '').replace(',', ';')
-                outputshapes = str(opsubnode.get('output_shapes', [])).replace(' ', '').replace(',', ';')
-                outputvalues = str(opsubnode.get('outputs', [])).replace(' ', '').replace(',', ';')
-                outputtypes = str(opsubnode.get('output_types', [])).replace(' ', '').replace(',', ';')
-
-                index += 1
-                data.append({
-                    "modelid": file.replace("graph_", "").replace(".json", ""),
-                    "layerid": index,
-                    "cpueventname": opsubnode['name'],
-                    "inputshapes": inputshapes,
-                    "inputvalues": inputvalues,
-                    "inputtypes": inputtypes,
-                    "outputshapes": outputshapes,
-                    "outputvalues": outputvalues,
-                    "outputtypes": outputtypes,
-                    "op_schema": op_schema.replace(',', ';')
-                })
-
-                # Save to CSV
-        df = pd.DataFrame(data)
-        directory = os.path.join('./data/middledata/graph')
-        os.makedirs(directory, exist_ok=True)
-        df.to_csv(directory +'/'+file.replace(".json", "")+ '.csv', index=False)
-
-if __name__ == "__main__":
-    dataprocessLayerv2() #map forward and backward operator
-    dataprocessgraphobserverv2() #for "schema": "1.0.1", version of graph observer
-    datamerge()
-    dataformatfortrace()
-    print("trace is under ./data/middledata/trace")
-
+    process_traces(cfg)

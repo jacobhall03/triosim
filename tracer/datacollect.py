@@ -1,146 +1,148 @@
 import os
-import time
+import sys
 import torch
 import torchvision
-import sys
-import numpy as np
 import torchvision.models as models
 from torchvision import transforms
 from tqdm import tqdm
-
-import torch.optim as optim
 import torch.nn as nn
-
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
-
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import profile, ProfilerActivity
 from torch.profiler import ExecutionTraceObserver
 
-bsinput=int(sys.argv[1])
-listmodel=[]
-num_iters = 43
-vgg11 = models.vgg11(weights=None)
-vgg13 = models.vgg13(weights=None)
-vgg16 = models.vgg16(weights=None)
-vgg19 = models.vgg19(weights=None)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-resnet18 = models.resnet18(weights=None)
-resnet34 = models.resnet34(weights=None)
-resnet50 = models.resnet50(weights=None)
-resnet101 = models.resnet101(weights=None)
-resnet152 = models.resnet152(weights=None)
+DEFAULT_CONFIG = {
+    'models': [
+        'vgg11', 'vgg13', 'vgg16', 'vgg19',
+        'resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152',
+        'densenet121', 'densenet161', 'densenet169', 'densenet201',
+    ],
+    'batch_sizes': [128],
+    'num_iters': 43,
+    'profile_start': 40,
+    'warmup_start': 30,
+    'dataset_path': os.path.join(_SCRIPT_DIR, 'ILSVRC2012_img_val'),
+    'data_dir': os.path.join(_SCRIPT_DIR, 'data'),
+    'workers': 8,
+}
 
-densenet161 = models.densenet161(weights=None)
-densenet169 = models.densenet169(weights=None)
-densenet121 = models.densenet121(weights=None)
-densenet201 = models.densenet201(weights=None)
 
-bslist=[bsinput]
+def collect_traces(config):
+    device = torch.device("cuda:0")
+    print(f"GPU count: {torch.cuda.device_count()}")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
 
-data_transforms = {
-    'predict': transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])}
+    graph_dir = os.path.join(config['data_dir'], 'graph')
+    profiler_dir = os.path.join(config['data_dir'], 'profiler')
+    os.makedirs(graph_dir, exist_ok=True)
+    os.makedirs(profiler_dir, exist_ok=True)
 
-device = torch.device("cuda:0")
-print(torch.cuda.device_count())
-print(torch.cuda.get_device_name(0))
-print(torch.cuda.current_device())
-   
-for bs in bslist:
-    
-    BATCH_SIZE = bs
-    EPOCHS = 1
-    WORKERS = 8
-    IMG_DIMS = (336, 336)
-    CLASSES = 10
+    data_transforms = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
 
-    dataset = {'predict' : torchvision.datasets.ImageFolder("./ILSVRC2012_img_val", data_transforms['predict'])}
-    dataset_subset=dataset['predict']
-    dataset_subset = torch.utils.data.Subset(dataset['predict'],range(BATCH_SIZE))
-    data_loader = {'predict': torch.utils.data.DataLoader(dataset_subset,
-                                            batch_size=BATCH_SIZE,
-                                            shuffle=False,
-                                            num_workers=WORKERS)}
+    num_iters = config.get('num_iters', 43)
+    profile_start = config.get('profile_start', 40)
+    warmup_start = config.get('warmup_start', 30)
 
-    listmodel=[vgg11,vgg13,vgg16,vgg19,resnet18,resnet34,resnet50,resnet101,resnet152,
-              densenet161,densenet169,densenet121,densenet201]
-    namelist = ['vgg11','vgg13','vgg16','vgg19','resnet18','resnet34','resnet50','resnet101','resnet152',
-              'densenet161','densenet169','densenet121','densenet201']
-    j = 0
-    for model in listmodel:
-        name = namelist[j]
-        print(f"Batch Size: {BATCH_SIZE}, Epochs: {EPOCHS}, Workers: {WORKERS}, Network: {name}")
-        j=j+1
-        try: 
-            model = model.to(device)
-            loss_fn = nn.CrossEntropyLoss()
-            optimizer = optim.Adam(model.parameters(), lr=0.01)
-            for epoch in range(EPOCHS): # 1 epoch
-                    model.train()
-                    for batch in tqdm(data_loader['predict'], total=len(data_loader['predict'])):
-                        features, labels = batch[0].to(device), batch[1].to(device)
-                        print( "Batchsize:", features.size())
-                        total_time1 = 0
-                        total_time2 = 0
-                        for i in range(num_iters):
-                            if 40<i<=num_iters-1:
-                                eg = ExecutionTraceObserver()
-                                eg.register_callback("./graph_"+name+"-iter"+str(i)+".json")
-                                eg.start()
-                                with profile(activities=[ProfilerActivity.CPU,ProfilerActivity.CUDA],record_shapes=True,with_stack=True,profile_memory=True) as prof: #,on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/resnet18')
-                                    torch.cuda.synchronize()
-                                    starter = torch.cuda.Event(enable_timing=True)
-                                    ender = torch.cuda.Event(enable_timing=True)
-                                    starter.record()
-                    
-                                    optimizer.zero_grad()
+    for bs in config['batch_sizes']:
+        dataset = torchvision.datasets.ImageFolder(config['dataset_path'], data_transforms)
+        subset = torch.utils.data.Subset(dataset, range(bs))
+        loader = torch.utils.data.DataLoader(
+            subset, batch_size=bs, shuffle=False,
+            num_workers=config.get('workers', 8),
+        )
 
-                                    preds = model(features)
-                                    loss = loss_fn(preds, labels)
+        for model_name in config['models']:
+            print(f"\nCollecting trace: model={model_name}, batch_size={bs}")
+            try:
+                model_fn = getattr(models, model_name)
+                model = model_fn(weights=None).to(device)
+                loss_fn = nn.CrossEntropyLoss()
+                optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+                model.train()
 
-                                    loss.backward()
-                                    optimizer.step()
-                                    
-                                    ender.record()
-                                    torch.cuda.synchronize()
-                                    curr_time = starter.elapsed_time(ender)
-                                    total_time1 += curr_time                           
-                                prof.export_chrome_trace("./profiler_"+name+"-iter"+str(i)+".json")
-                                eg.stop()
-                                eg.unregister_callback()
-                                print(name, "gpu time", curr_time)
-                            elif 30<i<=40:
+                for batch in tqdm(loader, total=len(loader)):
+                    features, labels = batch[0].to(device), batch[1].to(device)
+                    print(f"  batch shape: {features.size()}")
+                    total_time_profiled = 0.0
+                    total_time_warmup = 0.0
+
+                    for i in range(num_iters):
+                        if i > profile_start:
+                            graph_path = os.path.join(graph_dir, f"graph_{model_name}-iter{i}.json")
+                            profiler_path = os.path.join(profiler_dir, f"profiler_{model_name}-iter{i}.json")
+                            eg = ExecutionTraceObserver()
+                            eg.register_callback(graph_path)
+                            eg.start()
+                            with profile(
+                                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                                record_shapes=True, with_stack=True, profile_memory=True,
+                            ) as prof:
                                 torch.cuda.synchronize()
                                 starter = torch.cuda.Event(enable_timing=True)
                                 ender = torch.cuda.Event(enable_timing=True)
                                 starter.record()
-                                
                                 optimizer.zero_grad()
                                 preds = model(features)
                                 loss = loss_fn(preds, labels)
                                 loss.backward()
                                 optimizer.step()
-                                
                                 ender.record()
                                 torch.cuda.synchronize()
-                                curr_time = starter.elapsed_time(ender)
-                                total_time2 += curr_time
-                                print(name, "gpu time 2", curr_time)
-                            else:
-                                optimizer.zero_grad()
-                                preds = model(features)
-                                loss = loss_fn(preds, labels)
-                                loss.backward()
-                                optimizer.step()
-                        print("avg profiler Total time1:", total_time1/2)
-                        print("avg Total time2:", total_time2/10)
-                        
-        except Exception as e:
-            print(e)
-            pass
+                                total_time_profiled += starter.elapsed_time(ender)
+                            prof.export_chrome_trace(profiler_path)
+                            eg.stop()
+                            eg.unregister_callback()
+                        elif i > warmup_start:
+                            torch.cuda.synchronize()
+                            starter = torch.cuda.Event(enable_timing=True)
+                            ender = torch.cuda.Event(enable_timing=True)
+                            starter.record()
+                            optimizer.zero_grad()
+                            preds = model(features)
+                            loss = loss_fn(preds, labels)
+                            loss.backward()
+                            optimizer.step()
+                            ender.record()
+                            torch.cuda.synchronize()
+                            total_time_warmup += starter.elapsed_time(ender)
+                        else:
+                            optimizer.zero_grad()
+                            preds = model(features)
+                            loss = loss_fn(preds, labels)
+                            loss.backward()
+                            optimizer.step()
+
+                    profiled_count = num_iters - 1 - profile_start
+                    warmup_count = profile_start - warmup_start
+                    if profiled_count > 0:
+                        print(f"  avg profiled iter: {total_time_profiled / profiled_count:.2f} ms")
+                    if warmup_count > 0:
+                        print(f"  avg warmup iter:   {total_time_warmup / warmup_count:.2f} ms")
+
+            except Exception as e:
+                print(f"  ERROR tracing {model_name}: {e}")
+
+
+if __name__ == '__main__':
+    import yaml
+
+    cfg = DEFAULT_CONFIG.copy()
+
+    config_path = os.path.join(_SCRIPT_DIR, 'trace_config.yaml')
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            file_cfg = yaml.safe_load(f)
+        cfg.update(file_cfg)
+        for key in ('dataset_path', 'data_dir'):
+            if key in file_cfg and not os.path.isabs(file_cfg[key]):
+                cfg[key] = os.path.join(_SCRIPT_DIR, file_cfg[key])
+
+    if len(sys.argv) > 1:
+        cfg['batch_sizes'] = [int(sys.argv[1])]
+
+    collect_traces(cfg)
