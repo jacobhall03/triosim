@@ -1,0 +1,47 @@
+# Config for FX-method trace generation (--method fx)
+#
+# The FX method uses two passes:
+#   1. torch.fx symbolic trace + ShapeProp on CPU  -> graph structure & tensor shapes
+#   2. Per-operator GPU microbenchmarks             -> cudatime for each op in isolation
+#
+# No dataset is required. Peak GPU memory = one layer's weights + one batch of its
+# activations, so much larger batch sizes are feasible than with the original method.
+
+models:
+  - vgg11
+  - vgg13
+  - vgg16
+  - vgg19
+  - resnet18
+  - resnet34
+  - resnet50
+  - resnet101
+  - resnet152
+  - densenet121
+  - densenet161
+  - densenet169
+  - densenet201
+
+# Batch sizes to benchmark.
+# Larger values are safe here because only one layer is on the GPU at a time.
+batch_sizes:
+  - 32
+  - 64
+  - 128
+
+# Per-operator microbenchmark settings.
+# These keys are reused by the FX method with different meanings:
+#   num_iters   -> number of GPU kernel repetitions per operator timing measurement
+#   warmup_start -> number of warmup passes before timing each operator
+# (profile_start is unused by the FX method)
+num_iters: 10
+warmup_start: 3
+
+# Output directory for raw and processed data (relative to tracer/)
+data_dir: ./data
+
+# Operators that set tpflag=1 in trace.csv (tensor-parallelism eligible ops)
+target_ops:
+  - aten::conv2d
+  - aten::linear
+  - aten::embedding

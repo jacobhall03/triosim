@@ -82,10 +82,17 @@ def main():
                         help='Operator names that set tpflag=1 (overrides config target_ops)')
     parser.add_argument('--workers', type=int, metavar='N',
                         help='DataLoader worker count (overrides config)')
+    parser.add_argument('--method', choices=['original', 'fx'], default='original',
+                        help=(
+                            'Trace collection method. '
+                            '"original": full-model profiler run (requires entire model in GPU memory). '
+                            '"fx": torch.fx graph extraction + per-op microbenchmarks '
+                            '(memory-agnostic; peak GPU usage = one layer at a time).'
+                        ))
     parser.add_argument('--skip-collection', action='store_true',
-                        help='Skip profiler data collection (use existing JSON files in data/)')
+                        help='[original only] Skip profiler data collection (use existing JSON files in data/)')
     parser.add_argument('--skip-processing', action='store_true',
-                        help='Skip trace processing (use existing intermediate CSVs)')
+                        help='[original only] Skip trace processing (use existing intermediate CSVs)')
     parser.add_argument('--no-validate', action='store_true',
                         help='Skip validation of final trace files')
     parser.add_argument('--validate-only', action='store_true',
@@ -102,19 +109,26 @@ def main():
         validate_all(trace_out_dir)
         return
 
-    if not args.skip_collection:
+    if args.method == 'fx':
         print("=" * 60)
-        print("Step 1/2: Collecting traces from PyTorch profiler")
+        print("FX Method: torch.fx graph extraction + per-op microbenchmarks")
         print("=" * 60)
-        from datacollect import collect_traces
-        collect_traces(cfg)
+        from datacollect_fx import collect_traces_fx
+        collect_traces_fx(cfg)
+    else:
+        if not args.skip_collection:
+            print("=" * 60)
+            print("Step 1/2: Collecting traces from PyTorch profiler")
+            print("=" * 60)
+            from datacollect import collect_traces
+            collect_traces(cfg)
 
-    if not args.skip_processing:
-        print("=" * 60)
-        print("Step 2/2: Processing traces into TrioSim format")
-        print("=" * 60)
-        from dataprocess import process_traces
-        process_traces(cfg)
+        if not args.skip_processing:
+            print("=" * 60)
+            print("Step 2/2: Processing traces into TrioSim format")
+            print("=" * 60)
+            from dataprocess import process_traces
+            process_traces(cfg)
 
     if not args.no_validate:
         print("=" * 60)
