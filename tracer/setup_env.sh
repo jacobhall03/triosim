@@ -2,7 +2,7 @@
 set -e
 
 # Load required modules
-module load miniforge/25.3.1-py12
+module load miniforge/25.3.1-py3.21
 module load cuda/12.8.1
 module load cudnn/9.10.1.4-CUDA-12.8.1
 
@@ -20,5 +20,5 @@ conda run -n triosim pip install tqdm pandas numpy pyyaml
 
 echo ""
 echo "Setup complete. To activate the environment in your shell, run:"
-echo "  module load miniforge/25.3.1-py12"
+echo "  module load miniforge/25.3.1-py3.21"
 echo "  conda activate triosim"

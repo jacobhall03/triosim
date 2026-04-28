@@ -49,15 +49,22 @@ def collect_traces(config):
     warmup_start = config.get('warmup_start', 30)
 
     for bs in config['batch_sizes']:
-        dataset = torchvision.datasets.ImageFolder(config['dataset_path'], data_transforms)
-        subset = torch.utils.data.Subset(dataset, range(bs))
-        loader = torch.utils.data.DataLoader(
-            subset, batch_size=bs, shuffle=False,
-            num_workers=config.get('workers', 8),
-        )
+        dataset_path = config['dataset_path']
+        if os.path.isdir(dataset_path):
+            dataset = torchvision.datasets.ImageFolder(dataset_path, data_transforms)
+            subset = torch.utils.data.Subset(dataset, range(bs))
+            loader = torch.utils.data.DataLoader(
+                subset, batch_size=bs, shuffle=False,
+                num_workers=config.get('workers', 8),
+            )
+            batches = loader
+        else:
+            print(f"  Note: '{dataset_path}' not found, using synthetic random data")
+            batches = [(torch.randn(bs, 3, 224, 224), torch.randint(0, 1000, (bs,)))]
 
         for model_name in config['models']:
             print(f"\nCollecting trace: model={model_name}, batch_size={bs}")
+            model = None
             try:
                 model_fn = getattr(models, model_name)
                 model = model_fn(weights=None).to(device)
@@ -65,7 +72,7 @@ def collect_traces(config):
                 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
                 model.train()
 
-                for batch in tqdm(loader, total=len(loader)):
+                for batch in tqdm(batches, total=len(batches)):
                     features, labels = batch[0].to(device), batch[1].to(device)
                     print(f"  batch shape: {features.size()}")
                     total_time_profiled = 0.0
@@ -126,6 +133,9 @@ def collect_traces(config):
 
             except Exception as e:
                 print(f"  ERROR tracing {model_name}: {e}")
+            finally:
+                del model
+                torch.cuda.empty_cache()
 
 
 if __name__ == '__main__':

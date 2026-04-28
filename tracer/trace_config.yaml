@@ -15,13 +15,15 @@ models:
   - densenet201
 
 # Batch sizes to collect traces for
+# RTX 4000 Ada (10.57 GiB): use 64 max; 128 will OOM on vgg16+ and densenet*
 batch_sizes:
-  - 128
+  - 32
+  - 64
 
 # Iteration settings
-num_iters: 43       # Total training iterations per model
-profile_start: 40   # Collect profiler+graph data for iterations after this index
-warmup_start: 30    # Collect warmup timing for iterations after this index
+num_iters: 12       # Total training iterations per model
+profile_start: 10   # Collect profiler+graph data for iterations after this index
+warmup_start: 8     # Collect warmup timing for iterations after this index
 
 # Paths (relative to the tracer/ directory)
 dataset_path: ./ILSVRC2012_img_val
