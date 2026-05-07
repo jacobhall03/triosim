@@ -389,7 +389,7 @@ def _run_one_model(model_name, bs, device, out_base, target_ops, warmup, iters):
             ))
 
     # --- Write output ---
-    out_dir = os.path.join(out_base, model_name)
+    out_dir = os.path.join(out_base, f"bs{bs}", model_name)
     os.makedirs(out_dir, exist_ok=True)
 
     tensor_df = pd.DataFrame(
