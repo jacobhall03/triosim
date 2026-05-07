@@ -38,7 +38,7 @@ mkdir -p logs
 # Modules
 # ---------------------------------------------------------------------------
 module purge
-module load miniforge/25.3.1-py3.21
+module load miniforge/25.3.1-py3.12
 module load cuda/12.8.1
 module load cudnn/9.10.1.4-CUDA-12.8.1
 
