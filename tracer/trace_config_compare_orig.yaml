@@ -1,0 +1,26 @@
+# Config for original-method trace collection used in the fx vs. non-fx comparison.
+# Writes traces to ./data_compare_orig/ (separate from data_compare_fx/ to avoid overwrites).
+
+models:
+  - vgg13
+  - densenet161
+  - resnet50
+
+batch_sizes:
+  - 32
+
+# ~12 total iterations: 6 burn-in, 4 timed warmup, 2 profiled.
+num_iters: 12
+profile_start: 9
+warmup_start: 5
+
+# Falls back to synthetic random data if the dataset path does not exist.
+dataset_path: ./ILSVRC2012_img_val
+data_dir: ./data_compare_orig
+
+workers: 4
+
+target_ops:
+  - aten::conv2d
+  - aten::linear
+  - aten::embedding

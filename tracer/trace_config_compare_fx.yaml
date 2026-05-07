@@ -1,0 +1,21 @@
+# Config for FX-method trace collection used in the fx vs. non-fx comparison.
+# Writes traces to ./data_compare_fx/bs32/{model}/ (separate from data_compare_orig/).
+
+models:
+  - vgg13
+  - densenet161
+  - resnet50
+
+batch_sizes:
+  - 32
+
+# Per-operator microbenchmark settings: 10 timing reps, 3 warmup reps.
+num_iters: 10
+warmup_start: 3
+
+data_dir: ./data_compare_fx
+
+target_ops:
+  - aten::conv2d
+  - aten::linear
+  - aten::embedding
