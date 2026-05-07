@@ -167,6 +167,52 @@ def _process_layer(config):
         df.to_csv(out_path, index=False)
 
 
+def _process_graph_chakra(model_id, nodes):
+    """Process Chakra-format (PyTorch ≥2.0) execution graph nodes.
+
+    In the Chakra schema, nodes are flat (all parent=None), inputs/outputs are
+    dicts ({values, shapes, types, strides}), and op_schema lives in attrs.
+    Nodes are sorted by ascending id, which matches execution start order.
+    """
+    rows = []
+    idx = 0
+    for node in sorted(nodes, key=lambda n: n['id']):
+        name = node.get('name', '')
+        if name.startswith('[pytorch|profiler'):
+            continue
+        inp = node.get('inputs', {})
+        out = node.get('outputs', {})
+        in_values  = inp.get('values', [])
+        in_shapes  = inp.get('shapes', [])
+        in_types   = inp.get('types',  [])
+        out_values = out.get('values', [])
+        out_shapes = out.get('shapes', [])
+        out_types  = out.get('types',  [])
+        has_tensor = (any('tensor' in str(t).lower() for t in in_types) or
+                      any('tensor' in str(t).lower() for t in out_types))
+        if not has_tensor:
+            continue
+        op_schema = ''
+        for attr in node.get('attrs', []):
+            if attr.get('name') == 'op_schema':
+                op_schema = str(attr.get('value', '')).replace(',', ';')
+                break
+        idx += 1
+        rows.append({
+            'modelid':      model_id,
+            'layerid':      idx,
+            'cpueventname': name,
+            'inputshapes':  json.dumps(in_shapes),
+            'inputvalues':  json.dumps(in_values),
+            'inputtypes':   json.dumps(in_types),
+            'outputshapes': json.dumps(out_shapes),
+            'outputvalues': json.dumps(out_values),
+            'outputtypes':  json.dumps(out_types),
+            'op_schema':    op_schema,
+        })
+    return rows
+
+
 def _process_graph(config):
     """Parse execution graph JSON files → intermediate CSV with tensor metadata."""
     src_dir = os.path.join(config['data_dir'], 'graph')
@@ -183,63 +229,71 @@ def _process_graph(config):
             json_trace = json.load(f)
 
         nodes = json_trace['nodes']
-        id_to_node = {n['id']: n for n in nodes}
+        model_id = fname.replace('graph_', '').replace('.json', '')
 
-        nodes_level2 = [n for n in nodes if n.get('parent') == 2]
-        nodes_main = [n for n in nodes if n.get('parent') == 1]
+        # Chakra format (PyTorch ≥2.0): inputs is a dict; legacy format: nodes
+        # have an integer 'parent' field and inputs is a bare list.
+        is_chakra = bool(nodes) and isinstance(nodes[0].get('inputs'), dict)
 
-        back_id = None
-        for n in nodes_main:
-            if n['id'] not in {1, 2}:
-                back_id = n['id']
-        nodes_back = [n for n in nodes if n.get('parent') == back_id]
+        if is_chakra:
+            rows = _process_graph_chakra(model_id, nodes)
+        else:
+            # --- Legacy (PyTorch <2.0) format ---
+            nodes_level2 = [n for n in nodes if n.get('parent') == 2]
+            nodes_main   = [n for n in nodes if n.get('parent') == 1]
 
-        def node_row(name, node, idx):
-            return {
-                'modelid': fname.replace('graph_', '').replace('.json', ''),
-                'layerid': idx,
-                'cpueventname': name,
-                'inputshapes': json.dumps(node.get('input_shapes', [])),
-                'inputvalues': json.dumps(node.get('inputs', [])),
-                'inputtypes': json.dumps(node.get('input_types', [])),
-                'outputshapes': json.dumps(node.get('output_shapes', [])),
-                'outputvalues': json.dumps(node.get('outputs', [])),
-                'outputtypes': json.dumps(node.get('output_types', [])),
-                'op_schema': node.get('op_schema', '').replace(',', ';'),
-            }
+            back_id = None
+            for n in nodes_main:
+                if n['id'] not in {1, 2}:
+                    back_id = n['id']
+            nodes_back = [n for n in nodes if n.get('parent') == back_id]
 
-        def is_empty(n):
-            return (n.get('input_shapes') == [] and n.get('inputs') == [] and
-                    n.get('input_types') == [] and n.get('output_shapes') == [] and
-                    n.get('outputs') == [] and n.get('output_types') == [])
+            def node_row(name, node, idx):
+                return {
+                    'modelid':      model_id,
+                    'layerid':      idx,
+                    'cpueventname': name,
+                    'inputshapes':  json.dumps(node.get('input_shapes', [])),
+                    'inputvalues':  json.dumps(node.get('inputs', [])),
+                    'inputtypes':   json.dumps(node.get('input_types', [])),
+                    'outputshapes': json.dumps(node.get('output_shapes', [])),
+                    'outputvalues': json.dumps(node.get('outputs', [])),
+                    'outputtypes':  json.dumps(node.get('output_types', [])),
+                    'op_schema':    node.get('op_schema', '').replace(',', ';'),
+                }
 
-        def get_children(node):
-            return [n for n in nodes if n.get('parent') == node['id']]
+            def is_empty(n):
+                return (n.get('input_shapes') == [] and n.get('inputs') == [] and
+                        n.get('input_types') == [] and n.get('output_shapes') == [] and
+                        n.get('outputs') == [] and n.get('output_types') == [])
 
-        rows = []
-        idx = 0
-        optimizer_ids = []
+            def get_children(node):
+                return [n for n in nodes if n.get('parent') == node['id']]
 
-        for n in nodes_level2:
-            if 'Optimizer' in n['name']:
-                optimizer_ids.append(n['id'])
-            if not is_empty(n):
+            rows = []
+            idx = 0
+            optimizer_ids = []
+
+            for n in nodes_level2:
+                if 'Optimizer' in n['name']:
+                    optimizer_ids.append(n['id'])
+                if not is_empty(n):
+                    idx += 1
+                    rows.append(node_row(n['name'], n, idx))
+
+            for n in nodes_back:
+                children = get_children(n)
+                grandchildren = get_children(children[0]) if children else []
+                target = grandchildren[0] if grandchildren else (children[0] if children else None)
+                if target is None or is_empty(target):
+                    continue
                 idx += 1
-                rows.append(node_row(n['name'], n, idx))
+                rows.append(node_row(n['name'], target, idx))
 
-        for n in nodes_back:
-            children = get_children(n)
-            grandchildren = get_children(children[0]) if children else []
-            target = grandchildren[0] if grandchildren else (children[0] if children else None)
-            if target is None or is_empty(target):
-                continue
-            idx += 1
-            rows.append(node_row(n['name'], target, idx))
-
-        for op_id in optimizer_ids:
-            for subnode in [n for n in nodes if n.get('parent') == op_id]:
-                idx += 1
-                rows.append(node_row(subnode['name'], subnode, idx))
+            for op_id in optimizer_ids:
+                for subnode in [n for n in nodes if n.get('parent') == op_id]:
+                    idx += 1
+                    rows.append(node_row(subnode['name'], subnode, idx))
 
         df = pd.DataFrame(rows)
         _validate_df(df, _GRAPH_COLS, f'_process_graph/{fname}')
@@ -269,7 +323,30 @@ def _merge_data(config):
         df_graph = pd.read_csv(os.path.join(graph_dir, fname))
         df_profiler = pd.read_csv(profiler_path)
 
-        merged = pd.merge(df_graph, df_profiler, on=['layerid', 'cpueventname'], suffixes=('_graph', '_profiler'))
+        # Match the n-th occurrence of each op name in the graph CSV to the n-th
+        # in the profiler CSV.  This is robust to the Chakra (PyTorch ≥2.0) format
+        # where the graph is flat and sequential layerids no longer align between
+        # the two sources.  Inner call-stack duplicates present in the graph but
+        # absent in the profiler are silently dropped by the inner join.
+        df_graph['_occ']    = df_graph.groupby('cpueventname').cumcount()
+        df_profiler['_occ'] = df_profiler.groupby('cpueventname').cumcount()
+        merged = pd.merge(
+            df_graph, df_profiler,
+            on=['cpueventname', '_occ'],
+            suffixes=('_graph', '_profiler'),
+        )
+        merged = merged.drop(columns=['_occ'])
+
+        # Normalise layerid: after a suffixed merge it may appear as layerid_graph.
+        if 'layerid' not in merged.columns:
+            for candidate in ('layerid_graph', 'layerid_profiler'):
+                if candidate in merged.columns:
+                    merged = merged.rename(columns={candidate: 'layerid'})
+                    break
+        for col in ('layerid_graph', 'layerid_profiler'):
+            if col in merged.columns:
+                merged = merged.drop(columns=[col])
+
         merged = merged[merged['cpueventname'] != 'aten::item']
 
         conditions = [
@@ -278,9 +355,14 @@ def _merge_data(config):
         ]
         merged['stage'] = np.select(conditions, ['backward', 'optimizer'], default='forward')
 
-        target_sids = merged.loc[merged['cpueventname'].isin(target_ops), 'sequenceid'].unique()
         merged['tpflag'] = 0
-        merged.loc[merged['sequenceid'].isin(target_sids), 'tpflag'] = 1
+        if 'sequenceid' in merged.columns and merged['sequenceid'].notna().any():
+            # Legacy: propagate tpflag via sequence ID so related ops are marked.
+            target_sids = merged.loc[merged['cpueventname'].isin(target_ops), 'sequenceid'].unique()
+            merged.loc[merged['sequenceid'].isin(target_sids), 'tpflag'] = 1
+        else:
+            # Chakra / no sequence IDs: mark directly by op name.
+            merged.loc[merged['cpueventname'].isin(target_ops), 'tpflag'] = 1
 
         _validate_df(merged, _MERGE_COLS, f'_merge_data/{fname}')
         merged.to_csv(os.path.join(out_dir, fname.replace('graph_', '')), index=False)
@@ -326,16 +408,18 @@ def _format_trace(config):
                 print(f"    WARNING: JSON parse error in row {row.get('layerid')}: {e}, skipping")
                 continue
 
-            if pd.isna(row['op_schema']):
-                continue
-            schema_str = (row['op_schema']
-                          .replace('Tensor(a!)', 'Tensor')
-                          .replace('Tensor(a)', 'Tensor')
-                          .replace('Tensor(a -> *) self', 'Tensor input')
-                          .replace('Tensor self', 'Tensor input'))
-            if not schema_str.strip():
-                continue
-            op_schema = parse_op_schema(schema_str)
+            # op_schema is optional in the Chakra format; fall back to empty list
+            # so downstream code uses the 'input'/'output' defaults.
+            raw_schema = row['op_schema']
+            if pd.isna(raw_schema) or not str(raw_schema).strip():
+                op_schema = []
+            else:
+                schema_str = (str(raw_schema)
+                              .replace('Tensor(a!)', 'Tensor')
+                              .replace('Tensor(a)', 'Tensor')
+                              .replace('Tensor(a -> *) self', 'Tensor input')
+                              .replace('Tensor self', 'Tensor input'))
+                op_schema = parse_op_schema(schema_str) if schema_str.strip() else []
 
             input_tensor_ids = []
             output_tensor_ids = []
